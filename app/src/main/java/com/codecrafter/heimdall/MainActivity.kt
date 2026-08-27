@@ -3,11 +3,15 @@ package com.codecrafter.heimdall
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -93,8 +97,10 @@ private val Muted = Color(0xFF667085)
 private val Green = Color(0xFF16875B)
 private val Amber = Color(0xFFB76E00)
 
-private const val BLE_SCAN_WINDOW_MS = 10_000L
+private const val BLUETOOTH_SCAN_WINDOW_MS = 15_000L
 private const val SCAN_CYCLE_MS = 60_000L
+private const val MAX_VISIBLE_DISTANCE_METERS = 5.0
+private const val VISIBLE_FRESHNESS_MS = 90_000L
 
 private enum class RadioType { BLUETOOTH, WIFI, CELLULAR, RF }
 
@@ -124,6 +130,7 @@ class MainActivity : ComponentActivity() {
     private var statusText by mutableStateOf("Preparing scanner…")
     private var rfState by mutableStateOf(RfReceiverState())
     private var scanJob: Job? = null
+    private var classicReceiverRegistered = false
 
     private val bluetoothManager by lazy { getSystemService(BluetoothManager::class.java) }
     private val wifiManager by lazy {
@@ -136,12 +143,23 @@ class MainActivity : ComponentActivity() {
         override fun onScanResult(callbackType: Int, result: ScanResult) = handleBle(result)
         override fun onBatchScanResults(results: MutableList<ScanResult>) = results.forEach(::handleBle)
         override fun onScanFailed(errorCode: Int) {
-            runOnUiThread { statusText = "Bluetooth scan unavailable ($errorCode)" }
+            runOnUiThread { statusText = "Bluetooth LE scan unavailable ($errorCode)" }
+        }
+    }
+
+    private val classicBluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val safeIntent = intent ?: return
+            when (safeIntent.action) {
+                BluetoothDevice.ACTION_FOUND -> handleClassicBluetoothFound(safeIntent)
+                BluetoothDevice.ACTION_NAME_CHANGED -> handleBluetoothNameChanged(safeIntent)
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        registerClassicBluetoothReceiver()
         refreshRfReceiverState()
 
         setContent {
@@ -170,7 +188,29 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         pauseScanning()
+        unregisterClassicBluetoothReceiver()
         super.onDestroy()
+    }
+
+    private fun registerClassicBluetoothReceiver() {
+        if (classicReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothDevice.ACTION_NAME_CHANGED)
+        }
+        ContextCompat.registerReceiver(
+            this,
+            classicBluetoothReceiver,
+            filter,
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        classicReceiverRegistered = true
+    }
+
+    private fun unregisterClassicBluetoothReceiver() {
+        if (!classicReceiverRegistered) return
+        runCatching { unregisterReceiver(classicBluetoothReceiver) }
+        classicReceiverRegistered = false
     }
 
     @Composable
@@ -224,7 +264,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private suspend fun performScanCycle() {
         refreshRfReceiverState()
-        val bluetoothStarted = startBleWindow()
+        val bluetoothStarted = startBluetoothWindow()
         statusText = when {
             bluetoothStarted && rfState.connected -> "Scanning nearby signals · SDR connected"
             bluetoothStarted -> "Scanning nearby signals…"
@@ -236,8 +276,8 @@ class MainActivity : ComponentActivity() {
         refreshCellular()
         publishSnapshot()
 
-        delay(BLE_SCAN_WINDOW_MS)
-        stopBle()
+        delay(BLUETOOTH_SCAN_WINDOW_MS)
+        stopBluetooth()
         publishSnapshot()
 
         if (scanning) {
@@ -254,12 +294,12 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             statusText = "Refreshing now…"
             refreshRfReceiverState()
-            val bluetoothStarted = startBleWindow()
+            val bluetoothStarted = startBluetoothWindow()
             refreshWifi()
             refreshCellular()
             publishSnapshot()
-            delay(BLE_SCAN_WINDOW_MS)
-            if (bluetoothStarted) stopBle()
+            delay(BLUETOOTH_SCAN_WINDOW_MS)
+            if (bluetoothStarted) stopBluetooth()
             publishSnapshot()
             statusText = if (scanning) {
                 if (rfState.connected) "Waiting for next scan · RF receiver ready" else "Waiting for next scan…"
@@ -274,29 +314,45 @@ class MainActivity : ComponentActivity() {
         scanning = false
         scanJob?.cancel()
         scanJob = null
-        stopBle()
+        stopBluetooth()
         statusText = "Paused"
     }
 
     @SuppressLint("MissingPermission")
-    private fun startBleWindow(): Boolean {
+    private fun startBluetoothWindow(): Boolean {
         val adapter: BluetoothAdapter = bluetoothManager.adapter ?: return false
         if (!adapter.isEnabled) return false
+
+        if (adapter.isDiscovering) {
+            runCatching { adapter.cancelDiscovery() }
+        }
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        return runCatching {
-            adapter.bluetoothLeScanner?.startScan(null, settings, bleCallback)
+        val bleStarted = runCatching {
+            val scanner = adapter.bluetoothLeScanner ?: return@runCatching false
+            scanner.startScan(null, settings, bleCallback)
             true
         }.getOrDefault(false)
+
+        // Classic discovery is important for headphones, speakers and other devices
+        // that may not expose a useful BLE advertisement/name.
+        val classicStarted = runCatching { adapter.startDiscovery() }.getOrDefault(false)
+
+        return bleStarted || classicStarted
     }
 
     @SuppressLint("MissingPermission")
-    private fun stopBle() {
+    private fun stopBluetooth() {
         runCatching {
             bluetoothManager.adapter?.bluetoothLeScanner?.stopScan(bleCallback)
+        }
+        runCatching {
+            bluetoothManager.adapter?.let { adapter ->
+                if (adapter.isDiscovering) adapter.cancelDiscovery()
+            }
         }
     }
 
@@ -306,7 +362,12 @@ class MainActivity : ComponentActivity() {
         val address = runCatching { result.device.address }.getOrNull() ?: "BLE-${result.hashCode()}"
         val advertisedName = result.scanRecord?.deviceName
         val deviceName = runCatching { result.device.name }.getOrNull()
-        val name = advertisedName ?: deviceName ?: "Unknown Bluetooth device"
+        val alias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching { result.device.alias }.getOrNull()
+        } else {
+            null
+        }
+        val name = resolveBluetoothName(address, advertisedName, deviceName, alias)
         val txPower = result.scanRecord?.txPowerLevel?.takeIf { it in -100..-1 } ?: -59
         val distance = estimateDistance(result.rssi, txPower)
         val manufacturerIds = result.scanRecord?.manufacturerSpecificData?.let { data ->
@@ -315,7 +376,7 @@ class MainActivity : ComponentActivity() {
         val services = result.scanRecord?.serviceUuids?.joinToString { it.uuid.toString().take(8) }.orEmpty()
 
         val detail = buildString {
-            append("RSSI ${result.rssi} dBm")
+            append("Bluetooth LE · RSSI ${result.rssi} dBm")
             if (manufacturerIds.isNotBlank()) append(" · Manufacturer ID $manufacturerIds")
             if (services.isNotBlank()) append(" · Services $services")
         }
@@ -334,6 +395,88 @@ class MainActivity : ComponentActivity() {
                 seenCount = 1
             )
         )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleClassicBluetoothFound(intent: Intent) {
+        val device = bluetoothDeviceFromIntent(intent) ?: return
+        val address = runCatching { device.address }.getOrNull() ?: return
+        val rssiShort = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
+        if (rssiShort == Short.MIN_VALUE) return
+
+        val advertisedName = intent.getStringExtra(BluetoothDevice.EXTRA_NAME)
+        val deviceName = runCatching { device.name }.getOrNull()
+        val alias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching { device.alias }.getOrNull()
+        } else {
+            null
+        }
+        val name = resolveBluetoothName(address, advertisedName, deviceName, alias)
+        val rssi = rssiShort.toInt()
+        val distance = estimateDistance(rssi, -59)
+        val now = System.currentTimeMillis()
+
+        upsert(
+            SeenDevice(
+                id = address,
+                name = name,
+                type = RadioType.BLUETOOTH,
+                signalDbm = rssi,
+                distanceMeters = distance,
+                address = address,
+                detail = "Classic Bluetooth · RSSI $rssi dBm",
+                firstSeen = now,
+                lastSeen = now,
+                seenCount = 1
+            )
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleBluetoothNameChanged(intent: Intent) {
+        val device = bluetoothDeviceFromIntent(intent) ?: return
+        val address = runCatching { device.address }.getOrNull() ?: return
+        val changedName = intent.getStringExtra(BluetoothDevice.EXTRA_NAME)
+            ?: runCatching { device.name }.getOrNull()
+            ?: return
+        if (changedName.isBlank()) return
+
+        devices.computeIfPresent(address) { _, old -> old.copy(name = changedName) }
+        runOnUiThread { publishSnapshot() }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun resolveBluetoothName(
+        address: String,
+        advertisedName: String?,
+        deviceName: String?,
+        alias: String?
+    ): String {
+        val bonded = runCatching {
+            bluetoothManager.adapter?.bondedDevices?.firstOrNull {
+                runCatching { it.address.equals(address, ignoreCase = true) }.getOrDefault(false)
+            }
+        }.getOrNull()
+        val bondedName = bonded?.let { runCatching { it.name }.getOrNull() }
+        val bondedAlias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            bonded?.let { runCatching { it.alias }.getOrNull() }
+        } else {
+            null
+        }
+
+        return listOf(advertisedName, deviceName, alias, bondedName, bondedAlias)
+            .firstOrNull { !it.isNullOrBlank() }
+            ?.trim()
+            ?: "Unknown Bluetooth device"
+    }
+
+    @Suppress("DEPRECATION")
+    private fun bluetoothDeviceFromIntent(intent: Intent): BluetoothDevice? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+        } else {
+            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -449,24 +592,44 @@ class MainActivity : ComponentActivity() {
 
     private fun upsert(newValue: SeenDevice) {
         devices.compute(newValue.id) { _, old ->
-            if (old == null) newValue else newValue.copy(firstSeen = old.firstSeen, seenCount = old.seenCount + 1)
+            if (old == null) {
+                newValue
+            } else {
+                val preferredName = when {
+                    !isGenericBluetoothName(newValue.name) -> newValue.name
+                    !isGenericBluetoothName(old.name) -> old.name
+                    else -> newValue.name
+                }
+                newValue.copy(
+                    name = preferredName,
+                    firstSeen = old.firstSeen,
+                    seenCount = old.seenCount + 1
+                )
+            }
         }
         runOnUiThread { publishSnapshot() }
     }
 
+    private fun isGenericBluetoothName(name: String): Boolean =
+        name.isBlank() || name == "Unknown Bluetooth device"
+
     private fun publishSnapshot() {
         val now = System.currentTimeMillis()
         deviceSnapshot = devices.values
-            .filter { now - it.lastSeen < 24 * 60 * 60 * 1000L }
-            .sortedWith(compareBy<SeenDevice> { proximityRank(it) }.thenByDescending { it.lastSeen })
-    }
-
-    private fun proximityRank(device: SeenDevice): Int = when {
-        device.distanceMeters == null -> 4
-        device.distanceMeters < 2 -> 0
-        device.distanceMeters < 5 -> 1
-        device.distanceMeters < 10 -> 2
-        else -> 3
+            .asSequence()
+            .filter { now - it.lastSeen < VISIBLE_FRESHNESS_MS }
+            .filter { device ->
+                when (device.type) {
+                    RadioType.BLUETOOTH, RadioType.WIFI ->
+                        device.distanceMeters != null && device.distanceMeters <= MAX_VISIBLE_DISTANCE_METERS
+                    RadioType.CELLULAR, RadioType.RF -> true
+                }
+            }
+            .sortedWith(
+                compareBy<SeenDevice> { it.distanceMeters ?: Double.MAX_VALUE }
+                    .thenByDescending { it.lastSeen }
+            )
+            .toList()
     }
 
     private fun estimateDistance(rssi: Int, txPower: Int): Double {
@@ -553,8 +716,8 @@ private fun HeimdallScreen(
             Spacer(Modifier.height(18.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                CounterCard("Bluetooth", bluetoothCount, RadioType.BLUETOOTH, Modifier.weight(1f))
-                CounterCard("Wi‑Fi", wifiCount, RadioType.WIFI, Modifier.weight(1f))
+                CounterCard("Bluetooth ≤5m", bluetoothCount, RadioType.BLUETOOTH, Modifier.weight(1f))
+                CounterCard("Wi‑Fi ≤5m", wifiCount, RadioType.WIFI, Modifier.weight(1f))
             }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
@@ -570,7 +733,7 @@ private fun HeimdallScreen(
 
             Spacer(Modifier.height(10.dp))
             Text("${devices.count { isRecent(it) }} signals currently observed", fontWeight = FontWeight.SemiBold, color = Navy)
-            Text("Tap a signal for details. Distance is an estimate.", color = Muted, fontSize = 12.sp)
+            Text("Bluetooth/Wi‑Fi: only estimated ≤5 m, closest first.", color = Muted, fontSize = 12.sp)
             Text(
                 if (rfState.connected) "RF receiver: ${rfState.name}" else "RF receiver: not connected",
                 color = if (rfState.connected) Green else Muted,
@@ -582,7 +745,7 @@ private fun HeimdallScreen(
 
         if (devices.isEmpty()) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(if (scanning) "Looking for nearby signals…" else "Scanning is paused", color = Muted)
+                Text(if (scanning) "No devices estimated within 5 m yet…" else "Scanning is paused", color = Muted)
             }
         } else {
             LazyColumn(
@@ -739,7 +902,7 @@ private fun DetailLine(label: String, value: String) {
 }
 
 private fun typeLabel(type: RadioType) = when (type) {
-    RadioType.BLUETOOTH -> "Bluetooth / BLE"
+    RadioType.BLUETOOTH -> "Bluetooth (Classic / BLE)"
     RadioType.WIFI -> "Wi‑Fi"
     RadioType.CELLULAR -> "Cellular network cell"
     RadioType.RF -> "General RF"
@@ -749,9 +912,8 @@ private fun proximityLabel(device: SeenDevice): String = when {
     device.type == RadioType.RF -> signalLabel(device.signalDbm)
     device.distanceMeters == null -> signalLabel(device.signalDbm)
     device.distanceMeters < 2 -> "Very close"
-    device.distanceMeters < 5 -> "Nearby"
-    device.distanceMeters < 10 -> "Far"
-    else -> "Weak signal"
+    device.distanceMeters <= 5 -> "Nearby"
+    else -> "Outside range"
 }
 
 private fun signalLabel(dbm: Int?): String = when {
@@ -765,10 +927,10 @@ private fun formatDistance(meters: Double): String {
     return if (meters < 10) "${(meters * 10).roundToInt() / 10.0} m" else "${meters.roundToInt()} m"
 }
 
-private fun isRecent(device: SeenDevice): Boolean = System.currentTimeMillis() - device.lastSeen < 90_000
+private fun isRecent(device: SeenDevice): Boolean = System.currentTimeMillis() - device.lastSeen < VISIBLE_FRESHNESS_MS
 
 private fun isIntermittent(device: SeenDevice): Boolean =
-    device.seenCount > 1 && System.currentTimeMillis() - device.lastSeen > 90_000
+    device.seenCount > 1 && System.currentTimeMillis() - device.lastSeen > VISIBLE_FRESHNESS_MS
 
 private fun relativeTime(time: Long): String {
     val seconds = ((System.currentTimeMillis() - time) / 1000).coerceAtLeast(0)
