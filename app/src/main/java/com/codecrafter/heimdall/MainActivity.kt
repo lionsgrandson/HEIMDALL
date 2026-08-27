@@ -17,6 +17,8 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.wifi.ScanResult as WifiScanResult
 import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Bundle
 import android.telephony.CellInfo
@@ -102,7 +104,7 @@ private const val SCAN_CYCLE_MS = 60_000L
 private const val MAX_VISIBLE_DISTANCE_METERS = 5.0
 private const val VISIBLE_FRESHNESS_MS = 90_000L
 
-private enum class RadioType { BLUETOOTH, WIFI, CELLULAR, RF }
+private enum class RadioType { BLUETOOTH, WIFI, WIFI_DIRECT, CELLULAR, RF }
 
 private data class SeenDevice(
     val id: String,
@@ -123,14 +125,22 @@ private data class RfReceiverState(
     val detail: String = "RF dormant · connect a supported USB SDR receiver"
 )
 
+private data class PassiveWifiState(
+    val connected: Boolean = false,
+    val name: String = "No passive Wi‑Fi sensor",
+    val detail: String = "Phone-only Wi‑Fi sees access points, not arbitrary clients behind a router"
+)
+
 class MainActivity : ComponentActivity() {
     private val devices = ConcurrentHashMap<String, SeenDevice>()
     private var deviceSnapshot by mutableStateOf<List<SeenDevice>>(emptyList())
     private var scanning by mutableStateOf(false)
     private var statusText by mutableStateOf("Preparing scanner…")
     private var rfState by mutableStateOf(RfReceiverState())
+    private var passiveWifiState by mutableStateOf(PassiveWifiState())
     private var scanJob: Job? = null
     private var classicReceiverRegistered = false
+    private var wifiP2pReceiverRegistered = false
 
     private val bluetoothManager by lazy { getSystemService(BluetoothManager::class.java) }
     private val wifiManager by lazy {
@@ -138,6 +148,10 @@ class MainActivity : ComponentActivity() {
     }
     private val telephonyManager by lazy { getSystemService(TelephonyManager::class.java) }
     private val usbManager by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
+    private val wifiP2pManager by lazy {
+        getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+    }
+    private var wifiP2pChannel: WifiP2pManager.Channel? = null
 
     private val bleCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) = handleBle(result)
@@ -157,10 +171,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val wifiP2pReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> requestWifiP2pPeers()
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        wifiP2pChannel = if (packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT)) {
+            runCatching { wifiP2pManager.initialize(this, mainLooper, null) }.getOrNull()
+        } else {
+            null
+        }
         registerClassicBluetoothReceiver()
-        refreshRfReceiverState()
+        registerWifiP2pReceiver()
+        refreshExternalSensorStates()
 
         setContent {
             HeimdallTheme {
@@ -172,6 +200,7 @@ class MainActivity : ComponentActivity() {
                             scanning = scanning,
                             status = statusText,
                             rfState = rfState,
+                            passiveWifiState = passiveWifiState,
                             onRefresh = { forceRefresh() },
                             onToggle = { if (scanning) pauseScanning() else startScanning() }
                         )
@@ -183,12 +212,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        refreshRfReceiverState()
+        refreshExternalSensorStates()
     }
 
     override fun onDestroy() {
         pauseScanning()
         unregisterClassicBluetoothReceiver()
+        unregisterWifiP2pReceiver()
         super.onDestroy()
     }
 
@@ -213,6 +243,26 @@ class MainActivity : ComponentActivity() {
         classicReceiverRegistered = false
     }
 
+    private fun registerWifiP2pReceiver() {
+        if (wifiP2pReceiverRegistered || wifiP2pChannel == null) return
+        val filter = IntentFilter().apply {
+            addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
+        }
+        ContextCompat.registerReceiver(
+            this,
+            wifiP2pReceiver,
+            filter,
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        wifiP2pReceiverRegistered = true
+    }
+
+    private fun unregisterWifiP2pReceiver() {
+        if (!wifiP2pReceiverRegistered) return
+        runCatching { unregisterReceiver(wifiP2pReceiver) }
+        wifiP2pReceiverRegistered = false
+    }
+
     @Composable
     private fun PermissionGate(
         onPermissionsReady: () -> Unit,
@@ -225,6 +275,9 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 add(Manifest.permission.BLUETOOTH_SCAN)
                 add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
             }
         }.toTypedArray()
 
@@ -263,8 +316,10 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private suspend fun performScanCycle() {
-        refreshRfReceiverState()
+        refreshExternalSensorStates()
         val bluetoothStarted = startBluetoothWindow()
+        startWifiP2pDiscovery()
+
         statusText = when {
             bluetoothStarted && rfState.connected -> "Scanning nearby signals · SDR connected"
             bluetoothStarted -> "Scanning nearby signals…"
@@ -293,8 +348,9 @@ class MainActivity : ComponentActivity() {
     private fun forceRefresh() {
         lifecycleScope.launch {
             statusText = "Refreshing now…"
-            refreshRfReceiverState()
+            refreshExternalSensorStates()
             val bluetoothStarted = startBluetoothWindow()
+            startWifiP2pDiscovery()
             refreshWifi()
             refreshCellular()
             publishSnapshot()
@@ -315,6 +371,7 @@ class MainActivity : ComponentActivity() {
         scanJob?.cancel()
         scanJob = null
         stopBluetooth()
+        stopWifiP2pDiscovery()
         statusText = "Paused"
     }
 
@@ -337,8 +394,8 @@ class MainActivity : ComponentActivity() {
             true
         }.getOrDefault(false)
 
-        // Classic discovery is important for headphones, speakers and other devices
-        // that may not expose a useful BLE advertisement/name.
+        // Classic discovery is essential for headphones, speakers, phones and
+        // other devices that may not expose useful BLE advertisements.
         val classicStarted = runCatching { adapter.startDiscovery() }.getOrDefault(false)
 
         return bleStarted || classicStarted
@@ -480,6 +537,82 @@ class MainActivity : ComponentActivity() {
     }
 
     @SuppressLint("MissingPermission")
+    private fun startWifiP2pDiscovery() {
+        val channel = wifiP2pChannel ?: return
+        if (!hasWifiP2pPermission()) return
+
+        runCatching {
+            wifiP2pManager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() = Unit
+                override fun onFailure(reason: Int) = Unit
+            })
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestWifiP2pPeers() {
+        val channel = wifiP2pChannel ?: return
+        if (!hasWifiP2pPermission()) return
+
+        runCatching {
+            wifiP2pManager.requestPeers(channel) { peerList ->
+                peerList.deviceList.forEach(::handleWifiP2pDevice)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopWifiP2pDiscovery() {
+        val channel = wifiP2pChannel ?: return
+        if (!hasWifiP2pPermission()) return
+
+        runCatching {
+            wifiP2pManager.stopPeerDiscovery(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() = Unit
+                override fun onFailure(reason: Int) = Unit
+            })
+        }
+    }
+
+    private fun hasWifiP2pPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun handleWifiP2pDevice(device: WifiP2pDevice) {
+        val now = System.currentTimeMillis()
+        val address = device.deviceAddress?.takeIf { it.isNotBlank() } ?: "p2p-${device.hashCode()}"
+        val name = device.deviceName?.takeIf { it.isNotBlank() } ?: "Unknown Wi‑Fi Direct device"
+        val status = when (device.status) {
+            WifiP2pDevice.CONNECTED -> "connected"
+            WifiP2pDevice.INVITED -> "invited"
+            WifiP2pDevice.FAILED -> "failed"
+            WifiP2pDevice.AVAILABLE -> "available"
+            WifiP2pDevice.UNAVAILABLE -> "unavailable"
+            else -> "unknown"
+        }
+        val type = device.primaryDeviceType?.takeIf { it.isNotBlank() } ?: "unknown type"
+
+        upsert(
+            SeenDevice(
+                id = "p2p:$address",
+                name = name,
+                type = RadioType.WIFI_DIRECT,
+                signalDbm = null,
+                distanceMeters = null,
+                address = address,
+                detail = "Wi‑Fi Direct peer · $status · $type · Android does not expose peer RSSI here",
+                firstSeen = now,
+                lastSeen = now,
+                seenCount = 1
+            )
+        )
+    }
+
+    @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     private fun refreshWifi() {
         runCatching { wifiManager.startScan() }
@@ -510,7 +643,7 @@ class MainActivity : ComponentActivity() {
                     signalDbm = result.level,
                     distanceMeters = distance,
                     address = result.BSSID,
-                    detail = "RSSI ${result.level} dBm · $band · $security · ${frequency} MHz",
+                    detail = "Wi‑Fi access point · RSSI ${result.level} dBm · $band · $security · ${frequency} MHz",
                     firstSeen = now,
                     lastSeen = now,
                     seenCount = 1
@@ -562,16 +695,23 @@ class MainActivity : ComponentActivity() {
         else -> Triple("Cellular", null, cell.hashCode().toString())
     }
 
+    private fun refreshExternalSensorStates() {
+        refreshRfReceiverState()
+        refreshPassiveWifiReceiverState()
+    }
+
     private fun refreshRfReceiverState() {
         val matched = usbManager.deviceList.values.firstOrNull(::isSupportedSdr)
         rfState = if (matched == null) {
             RfReceiverState()
         } else {
-            val product = matched.productName?.takeIf { it.isNotBlank() } ?: "USB SDR receiver"
+            val product = matched.productName?.takeIf { it.isNotBlank() }
+                ?: matched.manufacturerName?.takeIf { it.isNotBlank() }
+                ?: "USB SDR receiver"
             RfReceiverState(
                 connected = true,
                 name = product,
-                detail = "SDR detected over USB · RF engine ready for native SDR driver integration"
+                detail = "SDR detected over USB · RF capture backend can be activated for this hardware"
             )
         }
     }
@@ -580,14 +720,44 @@ class MainActivity : ComponentActivity() {
         val vendor = device.vendorId
         val product = device.productId
 
-        // Common RTL2832U / RTL-SDR USB IDs. This intentionally stays conservative
-        // so HEIMDALL does not activate RF mode for unrelated USB devices.
+        // Common RTL2832U / RTL-SDR USB IDs.
         if (vendor == 0x0BDA && (product == 0x2832 || product == 0x2838)) return true
 
         val name = listOfNotNull(device.manufacturerName, device.productName)
             .joinToString(" ")
             .lowercase(Locale.ROOT)
+
+        // HackRF One/Pro can be recognized reliably by product/manufacturer text.
+        if ("hackrf" in name) return true
+
         return "rtl-sdr" in name || "rtlsdr" in name || "nesdr" in name
+    }
+
+    private fun refreshPassiveWifiReceiverState() {
+        val matched = usbManager.deviceList.values.firstOrNull(::isSupportedPassiveWifiAdapter)
+        passiveWifiState = if (matched == null) {
+            PassiveWifiState()
+        } else {
+            val product = matched.productName?.takeIf { it.isNotBlank() }
+                ?: matched.manufacturerName?.takeIf { it.isNotBlank() }
+                ?: "USB Wi‑Fi monitor adapter"
+            PassiveWifiState(
+                connected = true,
+                name = product,
+                detail = "USB Wi‑Fi sensor detected · passive client-frame capture requires the HEIMDALL Linux monitor bridge"
+            )
+        }
+    }
+
+    private fun isSupportedPassiveWifiAdapter(device: UsbDevice): Boolean {
+        // ALFA AWUS036ACM / MediaTek MT7612U.
+        if (device.vendorId == 0x0E8D && device.productId == 0x7612) return true
+
+        val name = listOfNotNull(device.manufacturerName, device.productName)
+            .joinToString(" ")
+            .lowercase(Locale.ROOT)
+        return listOf("awus036acm", "awus036axm", "awus036axml", "mt7612", "mt7921")
+            .any { it in name }
     }
 
     private fun upsert(newValue: SeenDevice) {
@@ -596,8 +766,8 @@ class MainActivity : ComponentActivity() {
                 newValue
             } else {
                 val preferredName = when {
-                    !isGenericBluetoothName(newValue.name) -> newValue.name
-                    !isGenericBluetoothName(old.name) -> old.name
+                    !isGenericName(newValue.name) -> newValue.name
+                    !isGenericName(old.name) -> old.name
                     else -> newValue.name
                 }
                 newValue.copy(
@@ -610,8 +780,10 @@ class MainActivity : ComponentActivity() {
         runOnUiThread { publishSnapshot() }
     }
 
-    private fun isGenericBluetoothName(name: String): Boolean =
-        name.isBlank() || name == "Unknown Bluetooth device"
+    private fun isGenericName(name: String): Boolean =
+        name.isBlank() ||
+            name == "Unknown Bluetooth device" ||
+            name == "Unknown Wi‑Fi Direct device"
 
     private fun publishSnapshot() {
         val now = System.currentTimeMillis()
@@ -622,7 +794,9 @@ class MainActivity : ComponentActivity() {
                 when (device.type) {
                     RadioType.BLUETOOTH, RadioType.WIFI ->
                         device.distanceMeters != null && device.distanceMeters <= MAX_VISIBLE_DISTANCE_METERS
-                    RadioType.CELLULAR, RadioType.RF -> true
+                    // Android does not expose useful ranging for these. They are shown
+                    // separately/after ranged devices instead of inventing a distance.
+                    RadioType.WIFI_DIRECT, RadioType.CELLULAR, RadioType.RF -> true
                 }
             }
             .sortedWith(
@@ -677,7 +851,7 @@ private fun PermissionScreen(onGrant: () -> Unit) {
         Text("HEIMDALL", color = Navy, fontWeight = FontWeight.Bold, fontSize = 28.sp, letterSpacing = 2.sp)
         Spacer(Modifier.height(12.dp))
         Text(
-            "Allow Nearby devices and Location so HEIMDALL can find Bluetooth, Wi‑Fi and cellular network signals. RF activates automatically when a supported USB SDR is connected.",
+            "Allow Nearby devices and Location so HEIMDALL can scan BLE, Classic Bluetooth, Wi‑Fi access points, Wi‑Fi Direct peers and cellular signals. External RF/passive Wi‑Fi sensors activate when supported hardware is present.",
             color = Muted,
             lineHeight = 22.sp
         )
@@ -694,11 +868,14 @@ private fun HeimdallScreen(
     scanning: Boolean,
     status: String,
     rfState: RfReceiverState,
+    passiveWifiState: PassiveWifiState,
     onRefresh: () -> Unit,
     onToggle: () -> Unit
 ) {
     val bluetoothCount = devices.count { it.type == RadioType.BLUETOOTH && isRecent(it) }
-    val wifiCount = devices.count { it.type == RadioType.WIFI && isRecent(it) }
+    val wifiCount = devices.count {
+        (it.type == RadioType.WIFI || it.type == RadioType.WIFI_DIRECT) && isRecent(it)
+    }
     val cellularCount = devices.count { it.type == RadioType.CELLULAR && isRecent(it) }
     val rfCount = devices.count { it.type == RadioType.RF && isRecent(it) }
 
@@ -717,7 +894,7 @@ private fun HeimdallScreen(
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 CounterCard("Bluetooth ≤5m", bluetoothCount, RadioType.BLUETOOTH, Modifier.weight(1f))
-                CounterCard("Wi‑Fi ≤5m", wifiCount, RadioType.WIFI, Modifier.weight(1f))
+                CounterCard("Wi‑Fi", wifiCount, RadioType.WIFI, Modifier.weight(1f))
             }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
@@ -733,7 +910,17 @@ private fun HeimdallScreen(
 
             Spacer(Modifier.height(10.dp))
             Text("${devices.count { isRecent(it) }} signals currently observed", fontWeight = FontWeight.SemiBold, color = Navy)
-            Text("Bluetooth/Wi‑Fi: only estimated ≤5 m, closest first.", color = Muted, fontSize = 12.sp)
+            Text("Ranged Bluetooth/Wi‑Fi APs: only estimated ≤5 m, closest first.", color = Muted, fontSize = 12.sp)
+            Text("Wi‑Fi Direct/RF entries can appear without a distance when Android cannot range them.", color = Muted, fontSize = 11.sp)
+            Text(
+                if (passiveWifiState.connected) {
+                    "Passive Wi‑Fi sensor: ${passiveWifiState.name}"
+                } else {
+                    "Passive Wi‑Fi clients: external monitor sensor not connected"
+                },
+                color = if (passiveWifiState.connected) Green else Amber,
+                fontSize = 11.sp
+            )
             Text(
                 if (rfState.connected) "RF receiver: ${rfState.name}" else "RF receiver: not connected",
                 color = if (rfState.connected) Green else Muted,
@@ -745,7 +932,7 @@ private fun HeimdallScreen(
 
         if (devices.isEmpty()) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(if (scanning) "No devices estimated within 5 m yet…" else "Scanning is paused", color = Muted)
+                Text(if (scanning) "No nearby transmitters found yet…" else "Scanning is paused", color = Muted)
             }
         } else {
             LazyColumn(
@@ -811,7 +998,7 @@ private fun CounterCard(
             Icon(
                 imageVector = when (type) {
                     RadioType.BLUETOOTH -> Icons.Default.Bluetooth
-                    RadioType.WIFI -> Icons.Default.Wifi
+                    RadioType.WIFI, RadioType.WIFI_DIRECT -> Icons.Default.Wifi
                     RadioType.CELLULAR -> Icons.Default.CellTower
                     RadioType.RF -> Icons.Default.SettingsInputAntenna
                 },
@@ -845,7 +1032,7 @@ private fun DeviceCard(device: SeenDevice) {
                 Icon(
                     imageVector = when (device.type) {
                         RadioType.BLUETOOTH -> Icons.Default.Bluetooth
-                        RadioType.WIFI -> Icons.Default.Wifi
+                        RadioType.WIFI, RadioType.WIFI_DIRECT -> Icons.Default.Wifi
                         RadioType.CELLULAR -> Icons.Default.CellTower
                         RadioType.RF -> Icons.Default.SettingsInputAntenna
                     },
@@ -875,7 +1062,14 @@ private fun DeviceCard(device: SeenDevice) {
                 HorizontalDivider(color = Color(0xFFE5EAF1))
                 Spacer(Modifier.height(10.dp))
                 device.address?.let {
-                    DetailLine(if (device.type == RadioType.WIFI) "BSSID" else "Address", it)
+                    DetailLine(
+                        when (device.type) {
+                            RadioType.WIFI -> "BSSID"
+                            RadioType.WIFI_DIRECT -> "P2P address"
+                            else -> "Address"
+                        },
+                        it
+                    )
                 }
                 device.signalDbm?.let { DetailLine("Signal", "$it dBm") }
                 DetailLine("First seen", absoluteTime(device.firstSeen))
@@ -883,6 +1077,14 @@ private fun DeviceCard(device: SeenDevice) {
                 if (device.type == RadioType.CELLULAR) {
                     Text(
                         "These are cellular network towers/cells visible to Android, not nearby phones.",
+                        color = Muted,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
+                if (device.type == RadioType.WIFI_DIRECT) {
+                    Text(
+                        "Wi‑Fi Direct discovery works without joining a router, but only devices exposing Wi‑Fi Direct can appear here.",
                         color = Muted,
                         fontSize = 11.sp,
                         modifier = Modifier.padding(top = 6.dp)
@@ -903,12 +1105,14 @@ private fun DetailLine(label: String, value: String) {
 
 private fun typeLabel(type: RadioType) = when (type) {
     RadioType.BLUETOOTH -> "Bluetooth (Classic / BLE)"
-    RadioType.WIFI -> "Wi‑Fi"
+    RadioType.WIFI -> "Wi‑Fi access point"
+    RadioType.WIFI_DIRECT -> "Wi‑Fi Direct peer"
     RadioType.CELLULAR -> "Cellular network cell"
     RadioType.RF -> "General RF"
 }
 
 private fun proximityLabel(device: SeenDevice): String = when {
+    device.type == RadioType.WIFI_DIRECT -> "Distance unknown"
     device.type == RadioType.RF -> signalLabel(device.signalDbm)
     device.distanceMeters == null -> signalLabel(device.signalDbm)
     device.distanceMeters < 2 -> "Very close"
