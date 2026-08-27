@@ -9,6 +9,8 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.net.wifi.ScanResult as WifiScanResult
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -29,6 +31,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -45,6 +48,8 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.CellTower
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SettingsInputAntenna
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -91,7 +96,7 @@ private val Amber = Color(0xFFB76E00)
 private const val BLE_SCAN_WINDOW_MS = 10_000L
 private const val SCAN_CYCLE_MS = 60_000L
 
-private enum class RadioType { BLUETOOTH, WIFI, CELLULAR }
+private enum class RadioType { BLUETOOTH, WIFI, CELLULAR, RF }
 
 private data class SeenDevice(
     val id: String,
@@ -106,11 +111,18 @@ private data class SeenDevice(
     val seenCount: Int
 )
 
+private data class RfReceiverState(
+    val connected: Boolean = false,
+    val name: String = "No SDR",
+    val detail: String = "RF dormant · connect a supported USB SDR receiver"
+)
+
 class MainActivity : ComponentActivity() {
     private val devices = ConcurrentHashMap<String, SeenDevice>()
     private var deviceSnapshot by mutableStateOf<List<SeenDevice>>(emptyList())
     private var scanning by mutableStateOf(false)
     private var statusText by mutableStateOf("Preparing scanner…")
+    private var rfState by mutableStateOf(RfReceiverState())
     private var scanJob: Job? = null
 
     private val bluetoothManager by lazy { getSystemService(BluetoothManager::class.java) }
@@ -118,6 +130,7 @@ class MainActivity : ComponentActivity() {
         applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
     }
     private val telephonyManager by lazy { getSystemService(TelephonyManager::class.java) }
+    private val usbManager by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
 
     private val bleCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) = handleBle(result)
@@ -129,6 +142,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        refreshRfReceiverState()
+
         setContent {
             HeimdallTheme {
                 PermissionGate(
@@ -138,12 +153,19 @@ class MainActivity : ComponentActivity() {
                             devices = deviceSnapshot,
                             scanning = scanning,
                             status = statusText,
+                            rfState = rfState,
+                            onRefresh = { forceRefresh() },
                             onToggle = { if (scanning) pauseScanning() else startScanning() }
                         )
                     }
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshRfReceiverState()
     }
 
     override fun onDestroy() {
@@ -169,8 +191,6 @@ class MainActivity : ComponentActivity() {
         val launcher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) {
-            // Changing this Compose state forces an immediate permission re-check.
-            // The previous version did not recompose here, so the Allow screen could stay stuck.
             permissionPromptCompleted = true
         }
 
@@ -184,40 +204,67 @@ class MainActivity : ComponentActivity() {
             }
             content()
         } else {
-            PermissionScreen {
-                launcher.launch(missing.toTypedArray())
-            }
+            PermissionScreen { launcher.launch(missing.toTypedArray()) }
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun startScanning() {
         if (scanning) return
-
         scanning = true
         scanJob?.cancel()
         scanJob = lifecycleScope.launch {
             while (isActive && scanning) {
-                val bluetoothStarted = startBleWindow()
-                statusText = if (bluetoothStarted) {
-                    "Scanning nearby signals…"
-                } else {
-                    "Scanning available signals · Bluetooth off"
-                }
+                performScanCycle()
+                delay(SCAN_CYCLE_MS)
+            }
+        }
+    }
 
-                refreshWifi()
-                refreshCellular()
-                publishSnapshot()
+    @SuppressLint("MissingPermission")
+    private suspend fun performScanCycle() {
+        refreshRfReceiverState()
+        val bluetoothStarted = startBleWindow()
+        statusText = when {
+            bluetoothStarted && rfState.connected -> "Scanning nearby signals · SDR connected"
+            bluetoothStarted -> "Scanning nearby signals…"
+            rfState.connected -> "Scanning available signals · SDR connected"
+            else -> "Scanning available signals · Bluetooth off"
+        }
 
-                delay(BLE_SCAN_WINDOW_MS)
-                stopBle()
-                publishSnapshot()
+        refreshWifi()
+        refreshCellular()
+        publishSnapshot()
 
-                if (scanning) {
-                    statusText = "Waiting for next scan…"
-                }
+        delay(BLE_SCAN_WINDOW_MS)
+        stopBle()
+        publishSnapshot()
 
-                delay(SCAN_CYCLE_MS - BLE_SCAN_WINDOW_MS)
+        if (scanning) {
+            statusText = if (rfState.connected) {
+                "Waiting for next scan · RF receiver ready"
+            } else {
+                "Waiting for next scan…"
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun forceRefresh() {
+        lifecycleScope.launch {
+            statusText = "Refreshing now…"
+            refreshRfReceiverState()
+            val bluetoothStarted = startBleWindow()
+            refreshWifi()
+            refreshCellular()
+            publishSnapshot()
+            delay(BLE_SCAN_WINDOW_MS)
+            if (bluetoothStarted) stopBle()
+            publishSnapshot()
+            statusText = if (scanning) {
+                if (rfState.connected) "Waiting for next scan · RF receiver ready" else "Waiting for next scan…"
+            } else {
+                "Refresh complete"
             }
         }
     }
@@ -256,8 +303,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun handleBle(result: ScanResult) {
         val now = System.currentTimeMillis()
-        val address = runCatching { result.device.address }.getOrNull()
-            ?: "BLE-${result.hashCode()}"
+        val address = runCatching { result.device.address }.getOrNull() ?: "BLE-${result.hashCode()}"
         val advertisedName = result.scanRecord?.deviceName
         val deviceName = runCatching { result.device.name }.getOrNull()
         val name = advertisedName ?: deviceName ?: "Unknown Bluetooth device"
@@ -266,18 +312,12 @@ class MainActivity : ComponentActivity() {
         val manufacturerIds = result.scanRecord?.manufacturerSpecificData?.let { data ->
             (0 until data.size()).joinToString { data.keyAt(it).toString() }
         }.orEmpty()
-        val services = result.scanRecord?.serviceUuids
-            ?.joinToString { it.uuid.toString().take(8) }
-            .orEmpty()
+        val services = result.scanRecord?.serviceUuids?.joinToString { it.uuid.toString().take(8) }.orEmpty()
 
         val detail = buildString {
             append("RSSI ${result.rssi} dBm")
-            if (manufacturerIds.isNotBlank()) {
-                append(" · Manufacturer ID $manufacturerIds")
-            }
-            if (services.isNotBlank()) {
-                append(" · Services $services")
-            }
+            if (manufacturerIds.isNotBlank()) append(" · Manufacturer ID $manufacturerIds")
+            if (services.isNotBlank()) append(" · Services $services")
         }
 
         upsert(
@@ -300,22 +340,16 @@ class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     private fun refreshWifi() {
         runCatching { wifiManager.startScan() }
-
-        val results: List<WifiScanResult> = runCatching {
-            wifiManager.scanResults
-        }.getOrDefault(emptyList())
-
+        val results: List<WifiScanResult> = runCatching { wifiManager.scanResults }.getOrDefault(emptyList())
         val now = System.currentTimeMillis()
+
         results.forEach { result ->
             val rawName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 result.wifiSsid?.toString()?.trim('"')
             } else {
                 result.SSID
             }
-            val name = rawName
-                ?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
-                ?: "Hidden Wi‑Fi network"
-
+            val name = rawName?.takeIf { it.isNotBlank() && it != "<unknown ssid>" } ?: "Hidden Wi‑Fi network"
             val frequency = result.frequency
             val band = when {
                 frequency >= 5925 -> "6 GHz"
@@ -344,35 +378,21 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun refreshCellular() {
-        val hasLocation = ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-
+        val hasLocation = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!hasLocation) return
-
-        val cells: List<CellInfo> = runCatching {
-            telephonyManager.allCellInfo ?: emptyList()
-        }.getOrDefault(emptyList())
-
+        val cells: List<CellInfo> = runCatching { telephonyManager.allCellInfo ?: emptyList() }.getOrDefault(emptyList())
         handleCells(cells)
     }
 
     private fun handleCells(cells: List<CellInfo>) {
         val now = System.currentTimeMillis()
-
         cells.forEachIndexed { index, cell ->
             val (technology, dbm, identity) = cellSummary(cell)
             val current = cell.isRegistered
-
             upsert(
                 SeenDevice(
                     id = "cell:$technology:$identity",
-                    name = if (current) {
-                        "$technology current network cell"
-                    } else {
-                        "$technology nearby network cell"
-                    },
+                    name = if (current) "$technology current network cell" else "$technology nearby network cell",
                     type = RadioType.CELLULAR,
                     signalDbm = dbm,
                     distanceMeters = null,
@@ -399,18 +419,38 @@ class MainActivity : ComponentActivity() {
         else -> Triple("Cellular", null, cell.hashCode().toString())
     }
 
+    private fun refreshRfReceiverState() {
+        val matched = usbManager.deviceList.values.firstOrNull(::isSupportedSdr)
+        rfState = if (matched == null) {
+            RfReceiverState()
+        } else {
+            val product = matched.productName?.takeIf { it.isNotBlank() } ?: "USB SDR receiver"
+            RfReceiverState(
+                connected = true,
+                name = product,
+                detail = "SDR detected over USB · RF engine ready for native SDR driver integration"
+            )
+        }
+    }
+
+    private fun isSupportedSdr(device: UsbDevice): Boolean {
+        val vendor = device.vendorId
+        val product = device.productId
+
+        // Common RTL2832U / RTL-SDR USB IDs. This intentionally stays conservative
+        // so HEIMDALL does not activate RF mode for unrelated USB devices.
+        if (vendor == 0x0BDA && (product == 0x2832 || product == 0x2838)) return true
+
+        val name = listOfNotNull(device.manufacturerName, device.productName)
+            .joinToString(" ")
+            .lowercase(Locale.ROOT)
+        return "rtl-sdr" in name || "rtlsdr" in name || "nesdr" in name
+    }
+
     private fun upsert(newValue: SeenDevice) {
         devices.compute(newValue.id) { _, old ->
-            if (old == null) {
-                newValue
-            } else {
-                newValue.copy(
-                    firstSeen = old.firstSeen,
-                    seenCount = old.seenCount + 1
-                )
-            }
+            if (old == null) newValue else newValue.copy(firstSeen = old.firstSeen, seenCount = old.seenCount + 1)
         }
-
         runOnUiThread { publishSnapshot() }
     }
 
@@ -418,10 +458,7 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         deviceSnapshot = devices.values
             .filter { now - it.lastSeen < 24 * 60 * 60 * 1000L }
-            .sortedWith(
-                compareBy<SeenDevice> { proximityRank(it) }
-                    .thenByDescending { it.lastSeen }
-            )
+            .sortedWith(compareBy<SeenDevice> { proximityRank(it) }.thenByDescending { it.lastSeen })
     }
 
     private fun proximityRank(device: SeenDevice): Int = when {
@@ -439,11 +476,7 @@ class MainActivity : ComponentActivity() {
 
     private fun estimateWifiDistance(rssi: Int, frequencyMhz: Int): Double {
         if (rssi == 0 || frequencyMhz <= 0) return 99.0
-        val exponent = (
-            27.55 -
-                20 * kotlin.math.log10(frequencyMhz.toDouble()) +
-                kotlin.math.abs(rssi)
-            ) / 20.0
+        val exponent = (27.55 - 20 * kotlin.math.log10(frequencyMhz.toDouble()) + kotlin.math.abs(rssi)) / 20.0
         return 10.0.pow(exponent).coerceIn(0.1, 99.0)
     }
 
@@ -465,46 +498,28 @@ private fun HeimdallTheme(content: @Composable () -> Unit) {
             surface = Color.White,
             background = Color.White
         ),
-        content = {
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = Color.White
-            ) {
-                content()
-            }
-        }
+        content = { Surface(modifier = Modifier.fillMaxSize(), color = Color.White) { content() } }
     )
 }
 
 @Composable
 private fun PermissionScreen(onGrant: () -> Unit) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(28.dp),
+        modifier = Modifier.fillMaxSize().padding(28.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         HeimdallLogo(88.dp)
         Spacer(Modifier.height(14.dp))
-        Text(
-            "HEIMDALL",
-            color = Navy,
-            fontWeight = FontWeight.Bold,
-            fontSize = 28.sp,
-            letterSpacing = 2.sp
-        )
+        Text("HEIMDALL", color = Navy, fontWeight = FontWeight.Bold, fontSize = 28.sp, letterSpacing = 2.sp)
         Spacer(Modifier.height(12.dp))
         Text(
-            "Allow Nearby devices and Location so HEIMDALL can find Bluetooth, Wi‑Fi and cellular network signals.",
+            "Allow Nearby devices and Location so HEIMDALL can find Bluetooth, Wi‑Fi and cellular network signals. RF activates automatically when a supported USB SDR is connected.",
             color = Muted,
             lineHeight = 22.sp
         )
         Spacer(Modifier.height(24.dp))
-        Button(
-            onClick = onGrant,
-            colors = ButtonDefaults.buttonColors(containerColor = Navy)
-        ) {
+        Button(onClick = onGrant, colors = ButtonDefaults.buttonColors(containerColor = Navy)) {
             Text("Allow scanning")
         }
     }
@@ -515,128 +530,94 @@ private fun HeimdallScreen(
     devices: List<SeenDevice>,
     scanning: Boolean,
     status: String,
+    rfState: RfReceiverState,
+    onRefresh: () -> Unit,
     onToggle: () -> Unit
 ) {
-    val bluetoothCount = devices.count {
-        it.type == RadioType.BLUETOOTH && isRecent(it)
-    }
-    val wifiCount = devices.count {
-        it.type == RadioType.WIFI && isRecent(it)
-    }
-    val cellularCount = devices.count {
-        it.type == RadioType.CELLULAR && isRecent(it)
-    }
+    val bluetoothCount = devices.count { it.type == RadioType.BLUETOOTH && isRecent(it) }
+    val wifiCount = devices.count { it.type == RadioType.WIFI && isRecent(it) }
+    val cellularCount = devices.count { it.type == RadioType.CELLULAR && isRecent(it) }
+    val rfCount = devices.count { it.type == RadioType.RF && isRecent(it) }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier.padding(
-                horizontal = 20.dp,
-                vertical = 18.dp
-            )
-        ) {
+        Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 HeimdallLogo(54.dp)
                 Spacer(Modifier.width(12.dp))
                 Column {
-                    Text(
-                        "HEIMDALL",
-                        color = Navy,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 25.sp,
-                        letterSpacing = 2.sp
-                    )
-                    Text(
-                        status,
-                        color = if (scanning) Green else Muted,
-                        fontSize = 13.sp
-                    )
+                    Text("HEIMDALL", color = Navy, fontWeight = FontWeight.Bold, fontSize = 25.sp, letterSpacing = 2.sp)
+                    Text(status, color = if (scanning) Green else Muted, fontSize = 13.sp)
                 }
             }
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(18.dp))
 
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                CounterCard("Bluetooth", bluetoothCount, RadioType.BLUETOOTH, Modifier.weight(1f))
+                CounterCard("Wi‑Fi", wifiCount, RadioType.WIFI, Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                CounterCard("Cellular", cellularCount, RadioType.CELLULAR, Modifier.weight(1f))
                 CounterCard(
-                    "Bluetooth",
-                    bluetoothCount,
-                    RadioType.BLUETOOTH,
-                    Modifier.weight(1f)
-                )
-                CounterCard(
-                    "Wi‑Fi",
-                    wifiCount,
-                    RadioType.WIFI,
-                    Modifier.weight(1f)
-                )
-                CounterCard(
-                    "Cellular",
-                    cellularCount,
-                    RadioType.CELLULAR,
-                    Modifier.weight(1f)
+                    label = if (rfState.connected) "RF · SDR ready" else "RF · dormant",
+                    count = rfCount,
+                    type = RadioType.RF,
+                    modifier = Modifier.weight(1f),
+                    enabled = rfState.connected
                 )
             }
 
-            Spacer(Modifier.height(12.dp))
-
+            Spacer(Modifier.height(10.dp))
+            Text("${devices.count { isRecent(it) }} signals currently observed", fontWeight = FontWeight.SemiBold, color = Navy)
+            Text("Tap a signal for details. Distance is an estimate.", color = Muted, fontSize = 12.sp)
             Text(
-                "${devices.count { isRecent(it) }} signals currently observed",
-                fontWeight = FontWeight.SemiBold,
-                color = Navy
-            )
-            Text(
-                "Tap a device for details. Distance is an estimate.",
-                color = Muted,
-                fontSize = 12.sp
+                if (rfState.connected) "RF receiver: ${rfState.name}" else "RF receiver: not connected",
+                color = if (rfState.connected) Green else Muted,
+                fontSize = 11.sp
             )
         }
 
         HorizontalDivider(color = Color(0xFFE8ECF2))
 
         if (devices.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    if (scanning) "Looking for nearby signals…" else "Scanning is paused",
-                    color = Muted
-                )
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(if (scanning) "Looking for nearby signals…" else "Scanning is paused", color = Muted)
             }
         } else {
             LazyColumn(
                 modifier = Modifier.weight(1f),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(9.dp)
             ) {
-                items(devices, key = { it.id }) { device ->
-                    DeviceCard(device)
-                }
+                items(devices, key = { it.id }) { device -> DeviceCard(device) }
             }
         }
 
-        Button(
-            onClick = onToggle,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
-                .height(54.dp),
-            shape = RoundedCornerShape(14.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Navy)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Icon(
-                if (scanning) Icons.Default.Pause else Icons.Default.PlayArrow,
-                contentDescription = null
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                if (scanning) "Pause" else "Resume",
-                fontSize = 16.sp
-            )
+            Button(
+                onClick = onRefresh,
+                modifier = Modifier.weight(1f).height(54.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Blue)
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+                Spacer(Modifier.width(7.dp))
+                Text("Scan now", fontSize = 15.sp)
+            }
+            Button(
+                onClick = onToggle,
+                modifier = Modifier.weight(1f).height(54.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Navy)
+            ) {
+                Icon(if (scanning) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = null)
+                Spacer(Modifier.width(7.dp))
+                Text(if (scanning) "Pause" else "Resume", fontSize = 15.sp)
+            }
         }
     }
 }
@@ -655,11 +636,12 @@ private fun CounterCard(
     label: String,
     count: Int,
     type: RadioType,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
 ) {
     Card(
         modifier = modifier,
-        colors = CardDefaults.cardColors(containerColor = SoftBlue),
+        colors = CardDefaults.cardColors(containerColor = if (enabled) SoftBlue else Color(0xFFF7F7F8)),
         shape = RoundedCornerShape(12.dp)
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -668,17 +650,13 @@ private fun CounterCard(
                     RadioType.BLUETOOTH -> Icons.Default.Bluetooth
                     RadioType.WIFI -> Icons.Default.Wifi
                     RadioType.CELLULAR -> Icons.Default.CellTower
+                    RadioType.RF -> Icons.Default.SettingsInputAntenna
                 },
                 contentDescription = null,
-                tint = Blue
+                tint = if (enabled) Blue else Muted
             )
-            Spacer(Modifier.height(7.dp))
-            Text(
-                count.toString(),
-                color = Navy,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Spacer(Modifier.height(6.dp))
+            Text(if (enabled) count.toString() else "—", color = if (enabled) Navy else Muted, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             Text(label, color = Muted, fontSize = 11.sp)
         }
     }
@@ -695,9 +673,7 @@ private fun DeviceCard(device: SeenDevice) {
     }
 
     Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { expanded = !expanded },
+        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
         colors = CardDefaults.cardColors(containerColor = Color(0xFFFAFBFD)),
         shape = RoundedCornerShape(14.dp)
     ) {
@@ -708,77 +684,39 @@ private fun DeviceCard(device: SeenDevice) {
                         RadioType.BLUETOOTH -> Icons.Default.Bluetooth
                         RadioType.WIFI -> Icons.Default.Wifi
                         RadioType.CELLULAR -> Icons.Default.CellTower
+                        RadioType.RF -> Icons.Default.SettingsInputAntenna
                     },
                     contentDescription = null,
                     tint = Blue
                 )
-
                 Spacer(Modifier.width(10.dp))
-
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        device.name,
-                        color = Navy,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1
-                    )
-                    Text(
-                        typeLabel(device.type),
-                        color = Muted,
-                        fontSize = 12.sp
-                    )
+                    Text(device.name, color = Navy, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(typeLabel(device.type), color = Muted, fontSize = 12.sp)
                 }
-
                 Column(horizontalAlignment = Alignment.End) {
-                    Text(
-                        label,
-                        color = labelColor,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 12.sp
-                    )
-                    device.distanceMeters?.let {
-                        Text(
-                            "~${formatDistance(it)}",
-                            color = Navy,
-                            fontSize = 13.sp
-                        )
-                    }
+                    Text(label, color = labelColor, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                    device.distanceMeters?.let { Text("~${formatDistance(it)}", color = Navy, fontSize = 13.sp) }
                 }
             }
 
             Spacer(Modifier.height(7.dp))
-            Text(
-                "Last seen ${relativeTime(device.lastSeen)} · Seen ${device.seenCount}×",
-                color = Muted,
-                fontSize = 11.sp
-            )
+            Text("Last seen ${relativeTime(device.lastSeen)} · Seen ${device.seenCount}×", color = Muted, fontSize = 11.sp)
 
             if (isIntermittent(device)) {
-                Text(
-                    "Intermittent signal",
-                    color = Amber,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
-                )
+                Text("Intermittent signal", color = Amber, fontSize = 11.sp, fontWeight = FontWeight.Bold)
             }
 
             if (expanded) {
                 Spacer(Modifier.height(10.dp))
                 HorizontalDivider(color = Color(0xFFE5EAF1))
                 Spacer(Modifier.height(10.dp))
-
                 device.address?.let {
-                    DetailLine(
-                        if (device.type == RadioType.WIFI) "BSSID" else "Address",
-                        it
-                    )
+                    DetailLine(if (device.type == RadioType.WIFI) "BSSID" else "Address", it)
                 }
-                device.signalDbm?.let {
-                    DetailLine("Signal", "$it dBm")
-                }
+                device.signalDbm?.let { DetailLine("Signal", "$it dBm") }
                 DetailLine("First seen", absoluteTime(device.firstSeen))
                 DetailLine("Details", device.detail)
-
                 if (device.type == RadioType.CELLULAR) {
                     Text(
                         "These are cellular network towers/cells visible to Android, not nearby phones.",
@@ -794,23 +732,9 @@ private fun DeviceCard(device: SeenDevice) {
 
 @Composable
 private fun DetailLine(label: String, value: String) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp)
-    ) {
-        Text(
-            label,
-            color = Muted,
-            fontSize = 11.sp,
-            modifier = Modifier.width(76.dp)
-        )
-        Text(
-            value,
-            color = Navy,
-            fontSize = 11.sp,
-            modifier = Modifier.weight(1f)
-        )
+    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(label, color = Muted, fontSize = 11.sp, modifier = Modifier.width(76.dp))
+        Text(value, color = Navy, fontSize = 11.sp, modifier = Modifier.weight(1f))
     }
 }
 
@@ -818,9 +742,11 @@ private fun typeLabel(type: RadioType) = when (type) {
     RadioType.BLUETOOTH -> "Bluetooth / BLE"
     RadioType.WIFI -> "Wi‑Fi"
     RadioType.CELLULAR -> "Cellular network cell"
+    RadioType.RF -> "General RF"
 }
 
 private fun proximityLabel(device: SeenDevice): String = when {
+    device.type == RadioType.RF -> signalLabel(device.signalDbm)
     device.distanceMeters == null -> signalLabel(device.signalDbm)
     device.distanceMeters < 2 -> "Very close"
     device.distanceMeters < 5 -> "Nearby"
@@ -836,21 +762,13 @@ private fun signalLabel(dbm: Int?): String = when {
 }
 
 private fun formatDistance(meters: Double): String {
-    return if (meters < 10) {
-        "${(meters * 10).roundToInt() / 10.0} m"
-    } else {
-        "${meters.roundToInt()} m"
-    }
+    return if (meters < 10) "${(meters * 10).roundToInt() / 10.0} m" else "${meters.roundToInt()} m"
 }
 
-private fun isRecent(device: SeenDevice): Boolean {
-    return System.currentTimeMillis() - device.lastSeen < 90_000
-}
+private fun isRecent(device: SeenDevice): Boolean = System.currentTimeMillis() - device.lastSeen < 90_000
 
-private fun isIntermittent(device: SeenDevice): Boolean {
-    return device.seenCount > 1 &&
-        System.currentTimeMillis() - device.lastSeen > 90_000
-}
+private fun isIntermittent(device: SeenDevice): Boolean =
+    device.seenCount > 1 && System.currentTimeMillis() - device.lastSeen > 90_000
 
 private fun relativeTime(time: Long): String {
     val seconds = ((System.currentTimeMillis() - time) / 1000).coerceAtLeast(0)
@@ -862,6 +780,5 @@ private fun relativeTime(time: Long): String {
     }
 }
 
-private fun absoluteTime(time: Long): String {
-    return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(time))
-}
+private fun absoluteTime(time: Long): String =
+    SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(time))
