@@ -17,6 +17,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/heimdall_logo"
+        android:roundIcon="@drawable/heimdall_logo"
         android:label="HEIMDALL"
         android:theme="@style/Theme.Heimdall"
         android:usesCleartextTraffic="false">
