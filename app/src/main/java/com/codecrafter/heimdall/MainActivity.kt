@@ -101,7 +101,7 @@ private val Amber = Color(0xFFB76E00)
 
 private const val BLUETOOTH_SCAN_WINDOW_MS = 15_000L
 private const val SCAN_CYCLE_MS = 60_000L
-private const val MAX_VISIBLE_DISTANCE_METERS = 5.0
+private const val MAX_VISIBLE_DISTANCE_METERS = 1.0
 private const val VISIBLE_FRESHNESS_MS = 90_000L
 
 private enum class RadioType { BLUETOOTH, WIFI, WIFI_DIRECT, CELLULAR, RF }
@@ -893,7 +893,7 @@ private fun HeimdallScreen(
             Spacer(Modifier.height(18.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                CounterCard("Bluetooth ≤5m", bluetoothCount, RadioType.BLUETOOTH, Modifier.weight(1f))
+                CounterCard("Bluetooth ≤1m", bluetoothCount, RadioType.BLUETOOTH, Modifier.weight(1f))
                 CounterCard("Wi‑Fi", wifiCount, RadioType.WIFI, Modifier.weight(1f))
             }
             Spacer(Modifier.height(8.dp))
@@ -910,7 +910,7 @@ private fun HeimdallScreen(
 
             Spacer(Modifier.height(10.dp))
             Text("${devices.count { isRecent(it) }} signals currently observed", fontWeight = FontWeight.SemiBold, color = Navy)
-            Text("Ranged Bluetooth/Wi‑Fi APs: only estimated ≤5 m, closest first.", color = Muted, fontSize = 12.sp)
+            Text("Ranged Bluetooth/Wi‑Fi APs: only estimated ≤1 m, closest first.", color = Muted, fontSize = 12.sp)
             Text("Wi‑Fi Direct/RF entries can appear without a distance when Android cannot range them.", color = Muted, fontSize = 11.sp)
             Text(
                 if (passiveWifiState.connected) {
